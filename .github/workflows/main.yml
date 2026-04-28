@@ -1,0 +1,374 @@
+name: "Nexus SaaS: Client Engine"
+
+on:
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  deploy-client-bot:
+    name: "Deploy & Sync Services"
+    runs-on: ubuntu-latest
+    timeout-minutes: 360 
+    
+    steps:
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v4
+
+      # ==================================================================
+      # [PHASE 1]: DEPENDENCY CACHING 
+      # ==================================================================
+      - name: 📦 Restore Module Cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            n8n_data/nodes
+            whatsapp/node_modules
+          key: nexus-nodes-cache-${{ runner.os }}
+
+      # ==================================================================
+      # [PHASE 2]: PRE-FLIGHT PREPARATION & COMMUNITY NODES SYNC
+      # ==================================================================
+      - name: 🐋 Pre-flight Setup & Dependency Compilation
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2_ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+          BUCKET: ${{ secrets.R2_BUCKET_NAME }}
+          CLIENT_MOBILE: ${{ secrets.CLIENT_MOBILE }}
+        run: |
+          sudo fallocate -l 4G /swapfile || true && sudo chmod 600 /swapfile || true && sudo mkswap /swapfile || true && sudo swapon /swapfile || true
+          sudo sysctl -w net.core.default_qdisc=fq && sudo sysctl -w net.ipv4.tcp_congestion_control=bbr
+          
+          sudo apt-get update -qq && sudo apt-get install -y sqlite3 curl zip unzip jq
+          
+          echo "Installing AWS CLI v2..."
+          curl -s "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+          unzip -q awscliv2.zip
+          sudo ./aws/install --update
+          
+          echo "Fetching Docker Images Synchronously..."
+          docker pull cloudflare/cloudflared:latest
+          docker pull n8nio/n8n:latest
+          docker pull caddy:latest
+          docker pull node:20-alpine
+          
+          echo "Preparing microservice directories..."
+          mkdir -p whatsapp public n8n_data/nodes
+          
+          # --- MULTI-VENDOR & LAZY LOAD WA SCRIPT ---
+          cat << 'EOF' > whatsapp/index.js
+          const { default: makeWASocket, DisconnectReason, useMultiFileAuthState, fetchLatestBaileysVersion, delay } = require('@whiskeysockets/baileys');
+          const express = require('express'); const axios = require('axios'); const QRCode = require('qrcode'); const pino = require('pino');
+          const fs = require('fs');
+          const app = express(); app.use(express.json());
+          
+          const PORT = 10000;
+          const N8N_URL = "http://n8n:5678/webhook/whatsapp"; 
+          const VENDORS = ['v1', 'v2', 'v3', 'v4'];
+          
+          const sessions = {};
+          const qrData = {};
+
+          async function start(v) {
+              if (sessions[v]) return; // Exit if already running to save resources
+
+              const authFolder = `auth_${v}`;
+              const { state, saveCreds } = await useMultiFileAuthState(authFolder);
+              const { version } = await fetchLatestBaileysVersion();
+              
+              // Anti-Ban Setup: Clean Standard Footprint
+              const sock = makeWASocket({ 
+                  version, 
+                  auth: state, 
+                  logger: pino({ level: 'silent' }), 
+                  browser: ["Windows", "Chrome", "124.0.0"], 
+                  markOnlineOnConnect: false, // Don't broadcast online status immediately
+                  generateHighQualityLinkPreview: true
+              });
+              
+              sessions[v] = sock;
+              sock.ev.on('creds.update', saveCreds);
+              
+              sock.ev.on('connection.update', (u) => { 
+                  if(u.qr) qrData[v] = u.qr; 
+                  if(u.connection === 'open') { qrData[v] = null; console.log(`[${v}] Connected!`); }
+                  if(u.connection === 'close') {
+                      const code = u.lastDisconnect?.error?.output?.statusCode;
+                      sessions[v] = null;
+                      if(code !== DisconnectReason.loggedOut) {
+                          setTimeout(() => start(v), 5000); // Reconnect if network drop
+                      } else {
+                          console.log(`[${v}] Logged out. Freeing up resources.`);
+                          if(fs.existsSync(authFolder)) fs.rmSync(authFolder, { recursive: true, force: true });
+                      }
+                  }
+              });
+              
+              sock.ev.on('messages.upsert', async ({ messages }) => {
+                  const msg = messages[0]; 
+                  if(!msg.message || msg.key.fromMe) return;
+                  
+                  // Forward directly to n8n (No fake read receipts/blue ticks)
+                  await axios.post(N8N_URL, { vendor: v, full_json: msg }).catch(() => {});
+              });
+          }
+
+          // LAZY BOOT: Only start vendors that have saved auth data
+          VENDORS.forEach(v => {
+              if (fs.existsSync(`auth_${v}`)) {
+                  console.log(`[${v}] Auth found. Booting session...`);
+                  start(v);
+              }
+          });
+
+          // API ENDPOINTS
+          app.get('/api/qr', async (req, res) => {
+              const v = req.query.v || 'v1';
+              if (!VENDORS.includes(v)) return res.status(400).json({ error: "Invalid vendor. Use v1 to v4." });
+
+              // Boot the socket only when QR is requested (Lazy Load)
+              if (!sessions[v]) await start(v); 
+
+              if(sessions[v]?.user) return res.json({ status: "connected", vendor: v, phone: sessions[v].user.id });
+              if(!qrData[v]) return res.json({ status: "generating", vendor: v });
+              res.json({ status: "qr_ready", vendor: v, qr_base64: await QRCode.toDataURL(qrData[v]) });
+          });
+
+          app.post('/api/reset', async (req, res) => {
+              const v = req.query.v;
+              if (!VENDORS.includes(v)) return res.status(400).json({ error: "Invalid vendor" });
+
+              if(sessions[v]) {
+                  sessions[v].logout();
+                  sessions[v] = null;
+              }
+              const authFolder = `auth_${v}`;
+              if(fs.existsSync(authFolder)) fs.rmSync(authFolder, { recursive: true, force: true });
+              qrData[v] = null;
+              
+              res.json({ status: "reset_initiated", vendor: v });
+          });
+
+          app.post('/send', async (req, res) => {
+              const { vendor, number, message } = req.body;
+              const v = vendor || 'v1';
+              const sock = sessions[v];
+              
+              if(!sock?.user) return res.status(503).json({ error: `Vendor ${v} is Offline or not logged in.` });
+              
+              const jid = number.includes('@') ? number : `${number}@s.whatsapp.net`;
+              
+              try {
+                  // Direct sending (No fake typing/composing delays)
+                  await sock.sendMessage(jid, { text: message });
+                  res.json({ status: true, vendor: v });
+              } catch (error) {
+                  res.status(500).json({ error: "Failed to send message", details: error.message });
+              }
+          });
+
+          app.get('/health', (req, res) => res.send("OK"));
+          app.listen(PORT, () => console.log("Nexus Multi-Vendor Engine Active on Port " + PORT));
+          EOF
+          
+          echo '{"name":"wa-bot","dependencies":{"@whiskeysockets/baileys":"latest","axios":"latest","express":"latest","qrcode":"latest","pino":"latest"}}' > whatsapp/package.json
+          
+          echo "Compiling WhatsApp Node Modules..."
+          docker run --rm -v $(pwd)/whatsapp:/app -w /app node:20-alpine sh -c "apk add --no-cache git python3 make g++ libc6-compat ffmpeg tzdata && npm install"
+          
+          # [JUGAD]: Download custom UI nodes list from R2 BEFORE handover
+          echo "Restoring custom n8n community nodes..."
+          aws s3 cp s3://$BUCKET/$CLIENT_MOBILE/nodes_package.json n8n_data/nodes/package.json --endpoint-url $R2_ENDPOINT >/dev/null 2>&1 || true
+          
+          cd n8n_data/nodes
+          if [ -f package.json ]; then 
+            echo "Installing user's saved community nodes..."
+            npm install --legacy-peer-deps --no-fund --no-audit
+          else
+            echo "No custom community nodes to restore."
+          fi
+          cd ../..
+
+      # ==================================================================
+      # [PHASE 3]: ZERO-DOWNTIME ROLLING UPDATE PROTOCOL
+      # ==================================================================
+      - name: 🤝 Execute Stateful Handover
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          echo "Scanning for previous deployment state..."
+          OLD_RUN=$(gh run list --workflow="main.yml" --json databaseId,status -q '[.[] | select(.databaseId != '${{ github.run_id }}' and (.status == "in_progress" or .status == "queued" or .status == "waiting" or .status == "requested"))] | .[0]?.databaseId')
+          
+          if [ -n "$OLD_RUN" ] && [ "$OLD_RUN" != "null" ]; then
+            echo "Previous deployment detected (ID: $OLD_RUN). Initiating graceful state transfer..."
+            gh run cancel $OLD_RUN
+            
+            echo "Awaiting state synchronization completion (Max timeout 3m)..."
+            for i in {1..36}; do
+              STATUS=$(gh run view $OLD_RUN --json status -q '.status' 2>/dev/null || echo "completed")
+              if [ "$STATUS" != "in_progress" ] && [ "$STATUS" != "queued" ] && [ "$STATUS" != "waiting" ]; then 
+                echo "State transfer successful. Terminating legacy instance."
+                break
+              fi
+              sleep 5
+            done
+          else
+            echo "No active deployments found. Initializing primary boot sequence."
+          fi
+
+      # ==================================================================
+      # [PHASE 4]: CLOUDFLARE R2 SYNC (Download Live Database)
+      # ==================================================================
+      - name: ☁️ Download State from Cloudflare R2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2_ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+          BUCKET: ${{ secrets.R2_BUCKET_NAME }}
+          CLIENT_MOBILE: ${{ secrets.CLIENT_MOBILE }}
+        run: |
+          echo "Pulling Client Data from R2 Storage: $CLIENT_MOBILE"
+          
+          aws s3 cp s3://$BUCKET/$CLIENT_MOBILE/database.sqlite n8n_data/database.sqlite --endpoint-url $R2_ENDPOINT || echo "Fresh n8n deployment."
+          
+          aws s3 cp s3://$BUCKET/$CLIENT_MOBILE/wa_auth.zip wa_auth.zip --endpoint-url $R2_ENDPOINT || echo "No existing WA session."
+          if [ -f wa_auth.zip ]; then
+            unzip wa_auth.zip -d whatsapp/ || true
+            rm wa_auth.zip
+          fi
+          
+          sudo chmod -R 777 n8n_data whatsapp
+
+      # ==================================================================
+      # [PHASE 5]: FLASH BOOT (Microservices Deployment)
+      # ==================================================================
+      - name: 🚀 Flash Boot Client Services
+        env:
+          CF_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
+          CLIENT_MOBILE: ${{ secrets.CLIENT_MOBILE }}
+          CLIENT_DOMAIN: ${{ secrets.CLIENT_DOMAIN }}
+          N8N_ENCRYPTION_KEY: ${{ secrets.N8N_ENCRYPTION_KEY }}
+        run: |
+          docker network create prod-net || true
+          
+          printf ":80 {\n reverse_proxy /* n8n:5678\n}\n" > Caddyfile
+          
+          docker run -d --name cloudflared --network host --restart unless-stopped \
+            cloudflare/cloudflared:latest tunnel --no-autoupdate run --token $CF_TOKEN
+            
+          docker run -d --name caddy --network prod-net -p 80:80 -v $(pwd)/Caddyfile:/etc/caddy/Caddyfile caddy:latest
+          
+          docker run -d --name n8n --network prod-net --restart unless-stopped \
+            -v $(pwd)/n8n_data:/home/node/.n8n \
+            -e NODE_PATH="/home/node/.n8n/nodes/node_modules" \
+            -e N8N_ENCRYPTION_KEY="$N8N_ENCRYPTION_KEY" \
+            -e WEBHOOK_URL="https://$CLIENT_DOMAIN" \
+            -e GENERIC_TIMEZONE="Asia/Kolkata" \
+            -e TZ="Asia/Kolkata" \
+            -e NODE_OPTIONS="--max-old-space-size=4096" \
+            -e UV_THREADPOOL_SIZE=8 \
+            -e N8N_BLOCK_ENV_ACCESS_IN_NODE=true \
+            -e N8N_HIDE_USAGE_PAGE="false" \
+            -e N8N_TEMPLATES_ENABLED=false \
+            -e N8N_PERSONALIZATION_ENABLED=false \
+            -e N8N_ONBOARDING_FLOW_DISABLED=true \
+            -e N8N_LOG_LEVEL=warn \
+            -e N8N_HIRING_BANNER_ENABLED=false \
+            -e EXECUTIONS_DATA_PRUNE=true \
+            -e EXECUTIONS_DATA_MAX_AGE=24 \
+            -e EXECUTIONS_DATA_PRUNE_MAX_COUNT=50 \
+            -e EXECUTIONS_DATA_SAVE_ON_SUCCESS=none \
+            -e EXECUTIONS_DATA_SAVE_ON_ERROR=all \
+            -e EXECUTIONS_DATA_SAVE_MANUAL_EXECUTIONS=false \
+            -e N8N_WORKFLOW_HISTORY_ENABLED=false \
+            -e N8N_DIAGNOSTICS_ENABLED=false \
+            -e N8N_VERSION_NOTIFICATIONS_ENABLED=false \
+            -e NODE_FUNCTION_ALLOW_BUILTIN=* \
+            -e NODE_FUNCTION_ALLOW_EXTERNAL=* \
+            n8nio/n8n
+
+          docker run -d --name wa-bot --network prod-net --restart unless-stopped \
+            -v $(pwd)/whatsapp:/app -w /app \
+            node:20-alpine sh -c "apk add --no-cache ffmpeg tzdata && node index.js"
+
+      # ==================================================================
+      # [PHASE 6]: STATE SYNC LOOP & SECURE SHUTDOWN
+      # ==================================================================
+      - name: 🔄 R2 Sync & Keep-Alive Loop
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          CLIENT_MOBILE: ${{ secrets.CLIENT_MOBILE }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2_ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+          BUCKET: ${{ secrets.R2_BUCKET_NAME }}
+        run: |
+          # [CRITICAL FIX]: 'set +e' ensures network drops don't crash the runner
+          set +e
+
+          upload_state() {
+              echo "Backing up state to R2 ($CLIENT_MOBILE)..."
+              
+              # [CRITICAL SQLITE FIX]: Use .backup to perfectly merge WAL data before upload
+              sqlite3 n8n_data/database.sqlite ".backup 'n8n_data/db_snapshot.sqlite'" >/dev/null 2>&1
+              aws s3 cp n8n_data/db_snapshot.sqlite s3://$BUCKET/$CLIENT_MOBILE/database.sqlite --endpoint-url $R2_ENDPOINT >/dev/null 2>&1 || echo "⚠️ SQLite R2 Sync Failed"
+              rm -f n8n_data/db_snapshot.sqlite
+              
+              rm -f wa_auth.zip
+              if [ -d "whatsapp" ]; then
+                cd whatsapp
+                zip -r ../wa_auth.zip auth_v*/ >/dev/null 2>&1
+                cd ..
+              fi
+              
+              if [ -f wa_auth.zip ]; then
+                  aws s3 cp wa_auth.zip s3://$BUCKET/$CLIENT_MOBILE/wa_auth.zip --endpoint-url $R2_ENDPOINT >/dev/null 2>&1 || echo "⚠️ WA Auth R2 Sync Failed"
+              fi
+              
+              if [ -f "n8n_data/nodes/package.json" ]; then
+                aws s3 cp n8n_data/nodes/package.json s3://$BUCKET/$CLIENT_MOBILE/nodes_package.json --endpoint-url $R2_ENDPOINT >/dev/null 2>&1
+              fi
+          }
+
+          cleanup() {
+              [ -f /tmp/sync_lock ] && exit 0; touch /tmp/sync_lock
+              echo "🛑 Pre-emption Signal Caught. Securing State..."
+              
+              docker kill cloudflared wa-bot >/dev/null 2>&1 || true
+              docker stop -t 3 n8n >/dev/null 2>&1 || true
+              
+              upload_state
+              exit 0
+          }
+          
+          trap 'cleanup' SIGINT SIGTERM SIGHUP
+          
+          START=$(date +%s)
+          
+          while true; do
+              NOW=$(date +%s); DIFF=$((NOW - START))
+              
+              if [ $DIFF -ge 21000 ]; then
+                  echo "TTL Threshold Reached. Triggering Next Runner..."
+                  gh workflow run main.yml >/dev/null 2>&1
+                  sleep 60
+                  exit 0
+              fi
+              
+              if ! docker ps | grep -q wa-bot; then docker restart wa-bot >/dev/null 2>&1; fi
+              if ! docker ps | grep -q n8n; then docker restart n8n >/dev/null 2>&1; fi
+              if ! docker ps | grep -q cloudflared; then docker restart cloudflared >/dev/null 2>&1; fi
+              
+              if [ $((DIFF % 900)) -lt 60 ] && [ $DIFF -gt 100 ]; then
+                  upload_state
+                  sleep 65
+              else
+                  sleep 5
+              fi
+          done
