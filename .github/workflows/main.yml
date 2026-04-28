@@ -2,6 +2,8 @@ name: "Nexus SaaS: Client Engine"
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: '*/15 * * * *'
 
 permissions:
   actions: write
@@ -16,6 +18,32 @@ jobs:
     steps:
       - name: 📥 Checkout Repository
         uses: actions/checkout@v4
+
+      # ==================================================================
+      # [PHASE 0]: 🛡️ AUTO-HEALER WATCHDOG (Smart Retry Logic)
+      # ==================================================================
+      - name: 🛡️ Watchdog & Anti-Overlap Check
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          # Check if this run was triggered by the 15-min timer
+          if [ "${{ github.event_name }}" == "schedule" ]; then
+            echo "Triggered by Cron Schedule (Watchdog mode)."
+            
+            # Count how many other runs are currently active/queued
+            ACTIVE_RUNS=$(gh run list --workflow="main.yml" --json status,databaseId -q '[.[] | select(.databaseId != '${{ github.run_id }}' and (.status == "in_progress" or .status == "queued" or .status == "waiting" or .status == "requested"))] | length')
+            
+            if [ "$ACTIVE_RUNS" -ge 1 ]; then
+              echo "🟢 Engine is already running healthy. Watchdog self-cancelling to save resources..."
+              gh run cancel ${{ github.run_id }}
+              sleep 30 # Wait for the cancellation to take effect
+              exit 0
+            else
+              echo "🔴 Engine is DOWN! Watchdog is initiating emergency boot sequence..."
+            fi
+          else
+            echo "Triggered manually or via 5.8-hour loop. Proceeding with standard boot..."
+          fi
 
       # ==================================================================
       # [PHASE 1]: DEPENDENCY CACHING 
