@@ -30,17 +30,15 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
         run: |
-          # Check if this run was triggered by the 15-min timer
           if [ "${{ github.event_name }}" == "schedule" ]; then
             echo "Triggered by Cron Schedule (Watchdog mode)."
             
-            # Count how many other runs are currently active/queued
             ACTIVE_RUNS=$(gh run list --workflow="main.yml" --json status,databaseId -q '[.[] | select(.databaseId != '${{ github.run_id }}' and (.status == "in_progress" or .status == "queued" or .status == "waiting" or .status == "requested"))] | length')
             
             if [ "$ACTIVE_RUNS" -ge 1 ]; then
               echo "🟢 Engine is already running healthy. Watchdog self-cancelling to save resources..."
               gh run cancel ${{ github.run_id }}
-              sleep 30 # Wait for the cancellation to take effect
+              sleep 30
               exit 0
             else
               echo "🔴 Engine is DOWN! Watchdog is initiating emergency boot sequence..."
@@ -106,19 +104,18 @@ jobs:
           const qrData = {};
 
           async function start(v) {
-              if (sessions[v]) return; // Exit if already running to save resources
+              if (sessions[v]) return; 
 
               const authFolder = `auth_${v}`;
               const { state, saveCreds } = await useMultiFileAuthState(authFolder);
               const { version } = await fetchLatestBaileysVersion();
               
-              // Anti-Ban Setup: Clean Standard Footprint
               const sock = makeWASocket({ 
                   version, 
                   auth: state, 
                   logger: pino({ level: 'silent' }), 
                   browser: ["Windows", "Chrome", "124.0.0"], 
-                  markOnlineOnConnect: false, // Don't broadcast online status immediately
+                  markOnlineOnConnect: false,
                   generateHighQualityLinkPreview: true
               });
               
@@ -132,9 +129,9 @@ jobs:
                       const code = u.lastDisconnect?.error?.output?.statusCode;
                       sessions[v] = null;
                       if(code !== DisconnectReason.loggedOut) {
-                          setTimeout(() => start(v), 5000); // Reconnect if network drop
+                          setTimeout(() => start(v), 5000); 
                       } else {
-                          console.log(`[${v}] Logged out. Freeing up resources.`);
+                          console.log(`[${v}] Logged out.`);
                           if(fs.existsSync(authFolder)) fs.rmSync(authFolder, { recursive: true, force: true });
                       }
                   }
@@ -143,28 +140,31 @@ jobs:
               sock.ev.on('messages.upsert', async ({ messages }) => {
                   const msg = messages[0]; 
                   
-                  // [OPTIMIZATION]: Drop empty msgs, outgoing msgs, AND WhatsApp Status updates (status@broadcast)
-                  if(!msg || !msg.message || msg.key.fromMe || msg.key.remoteJid === 'status@broadcast') return;
+                  // [FILTER 1]: Drop empty, malformed, or self-sent outgoing messages
+                  if(!msg || !msg.message || msg.key?.fromMe) return;
                   
-                  // Forward directly to n8n
+                  const jid = msg.key?.remoteJid || '';
+                  
+                  // [FILTER 2]: Block Status Updates and Group Chat Messages (DDoS protection)
+                  if(jid === 'status@broadcast' || jid.endsWith('@g.us')) return;
+                  
+                  // [FILTER 3]: Block "Message Deleted" and "Security Code" system alerts
+                  if(msg.message?.protocolMessage || msg.message?.senderKeyDistributionMessage) return;
+                  
+                  // Forward 100% clean Direct Messages to n8n
                   await axios.post(N8N_URL, { vendor: v, full_json: msg }).catch(() => {});
               });
           }
 
-          // LAZY BOOT: Only start vendors that have saved auth data
           VENDORS.forEach(v => {
-              if (fs.existsSync(`auth_${v}`)) {
-                  console.log(`[${v}] Auth found. Booting session...`);
-                  start(v);
-              }
+              if (fs.existsSync(`auth_${v}`)) start(v);
           });
 
           // API ENDPOINTS
           app.get('/api/qr', async (req, res) => {
               const v = req.query.v || 'v1';
-              if (!VENDORS.includes(v)) return res.status(400).json({ error: "Invalid vendor. Use v1 to v4." });
+              if (!VENDORS.includes(v)) return res.status(400).json({ error: "Invalid vendor." });
 
-              // Boot the socket only when QR is requested (Lazy Load)
               if (!sessions[v]) await start(v); 
 
               if(sessions[v]?.user) return res.json({ status: "connected", vendor: v, phone: sessions[v].user.id });
@@ -192,12 +192,11 @@ jobs:
               const v = vendor || 'v1';
               const sock = sessions[v];
               
-              if(!sock?.user) return res.status(503).json({ error: `Vendor ${v} is Offline or not logged in.` });
+              if(!sock?.user) return res.status(503).json({ error: `Vendor ${v} is Offline.` });
               
               const jid = number.includes('@') ? number : `${number}@s.whatsapp.net`;
               
               try {
-                  // Direct sending (No fake typing/composing delays)
                   await sock.sendMessage(jid, { text: message });
                   res.json({ status: true, vendor: v });
               } catch (error) {
@@ -205,8 +204,7 @@ jobs:
               }
           });
 
-          app.get('/health', (req, res) => res.send("OK"));
-          app.listen(PORT, () => console.log("Nexus Multi-Vendor Engine Active on Port " + PORT));
+          app.listen(PORT, () => console.log("Nexus Multi-Vendor Engine Active"));
           EOF
           
           echo '{"name":"wa-bot","dependencies":{"@whiskeysockets/baileys":"latest","axios":"latest","express":"latest","qrcode":"latest","pino":"latest"}}' > whatsapp/package.json
@@ -214,7 +212,6 @@ jobs:
           echo "Compiling WhatsApp Node Modules..."
           docker run --rm -v $(pwd)/whatsapp:/app -w /app node:20-alpine sh -c "apk add --no-cache git python3 make g++ libc6-compat ffmpeg tzdata && npm install"
           
-          # [JUGAD]: Download custom UI nodes list from R2 BEFORE handover
           echo "Restoring custom n8n community nodes..."
           aws s3 cp s3://$BUCKET/$CLIENT_MOBILE/nodes_package.json n8n_data/nodes/package.json --endpoint-url $R2_ENDPOINT >/dev/null 2>&1 || true
           
@@ -234,24 +231,19 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
         run: |
-          echo "Scanning for previous deployment state..."
           OLD_RUN=$(gh run list --workflow="main.yml" --json databaseId,status -q '[.[] | select(.databaseId != '${{ github.run_id }}' and (.status == "in_progress" or .status == "queued" or .status == "waiting" or .status == "requested"))] | .[0]?.databaseId')
           
           if [ -n "$OLD_RUN" ] && [ "$OLD_RUN" != "null" ]; then
-            echo "Previous deployment detected (ID: $OLD_RUN). Initiating graceful state transfer..."
+            echo "Previous deployment detected (ID: $OLD_RUN). Initiating state transfer..."
             gh run cancel $OLD_RUN
             
-            echo "Awaiting state synchronization completion (Max timeout 3m)..."
             for i in {1..36}; do
               STATUS=$(gh run view $OLD_RUN --json status -q '.status' 2>/dev/null || echo "completed")
               if [ "$STATUS" != "in_progress" ] && [ "$STATUS" != "queued" ] && [ "$STATUS" != "waiting" ]; then 
-                echo "State transfer successful. Terminating legacy instance."
                 break
               fi
               sleep 5
             done
-          else
-            echo "No active deployments found. Initializing primary boot sequence."
           fi
 
       # ==================================================================
@@ -266,11 +258,9 @@ jobs:
           BUCKET: ${{ secrets.R2_BUCKET_NAME }}
           CLIENT_MOBILE: ${{ secrets.CLIENT_MOBILE }}
         run: |
-          echo "Pulling Client Data from R2 Storage: $CLIENT_MOBILE"
-          
           aws s3 cp s3://$BUCKET/$CLIENT_MOBILE/database.sqlite n8n_data/database.sqlite --endpoint-url $R2_ENDPOINT || echo "Fresh n8n deployment."
-          
           aws s3 cp s3://$BUCKET/$CLIENT_MOBILE/wa_auth.zip wa_auth.zip --endpoint-url $R2_ENDPOINT || echo "No existing WA session."
+          
           if [ -f wa_auth.zip ]; then
             unzip wa_auth.zip -d whatsapp/ || true
             rm wa_auth.zip
@@ -343,15 +333,11 @@ jobs:
           R2_ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
           BUCKET: ${{ secrets.R2_BUCKET_NAME }}
         run: |
-          # [CRITICAL FIX]: 'set +e' ensures network drops don't crash the runner
           set +e
 
           upload_state() {
-              echo "Backing up state to R2 ($CLIENT_MOBILE)..."
-              
-              # [CRITICAL SQLITE FIX]: Use .backup to perfectly merge WAL data before upload
               sqlite3 n8n_data/database.sqlite ".backup 'n8n_data/db_snapshot.sqlite'" >/dev/null 2>&1
-              aws s3 cp n8n_data/db_snapshot.sqlite s3://$BUCKET/$CLIENT_MOBILE/database.sqlite --endpoint-url $R2_ENDPOINT >/dev/null 2>&1 || echo "⚠️ SQLite R2 Sync Failed"
+              aws s3 cp n8n_data/db_snapshot.sqlite s3://$BUCKET/$CLIENT_MOBILE/database.sqlite --endpoint-url $R2_ENDPOINT >/dev/null 2>&1
               rm -f n8n_data/db_snapshot.sqlite
               
               rm -f wa_auth.zip
@@ -362,7 +348,7 @@ jobs:
               fi
               
               if [ -f wa_auth.zip ]; then
-                  aws s3 cp wa_auth.zip s3://$BUCKET/$CLIENT_MOBILE/wa_auth.zip --endpoint-url $R2_ENDPOINT >/dev/null 2>&1 || echo "⚠️ WA Auth R2 Sync Failed"
+                  aws s3 cp wa_auth.zip s3://$BUCKET/$CLIENT_MOBILE/wa_auth.zip --endpoint-url $R2_ENDPOINT >/dev/null 2>&1
               fi
               
               if [ -f "n8n_data/nodes/package.json" ]; then
@@ -372,7 +358,6 @@ jobs:
 
           cleanup() {
               [ -f /tmp/sync_lock ] && exit 0; touch /tmp/sync_lock
-              echo "🛑 Pre-emption Signal Caught. Securing State..."
               
               docker kill cloudflared wa-bot >/dev/null 2>&1 || true
               docker stop -t 3 n8n >/dev/null 2>&1 || true
@@ -389,7 +374,6 @@ jobs:
               NOW=$(date +%s); DIFF=$((NOW - START))
               
               if [ $DIFF -ge 21000 ]; then
-                  echo "TTL Threshold Reached. Triggering Next Runner..."
                   gh workflow run main.yml >/dev/null 2>&1
                   sleep 60
                   exit 0
