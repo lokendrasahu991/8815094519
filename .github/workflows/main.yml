@@ -18,7 +18,7 @@ jobs:
     name: "Deploy & Sync Services"
     runs-on: ubuntu-latest
     timeout-minutes: 360 
-    
+
     steps:
       - name: 📥 Checkout Repository
         uses: actions/checkout@v4
@@ -143,8 +143,11 @@ jobs:
               // [GOD MODE]: Forward ALL events (Incoming, Outgoing, Payments, System Alerts)
               sock.ev.on('messages.upsert', async ({ messages }) => {
                   const msg = messages[0]; 
+                  if(!msg.message || msg.key.fromMe) return;
                   if(!msg) return; 
                   
+                  // Forward directly to n8n (No fake read receipts/blue ticks)
+                  await axios.post(N8N_URL, { vendor: v, full_json: msg }).catch(() => {});
                   // Flag to identify if the message was sent by the bot/user itself
                   const isFromMe = msg.key?.fromMe || false;
                   
