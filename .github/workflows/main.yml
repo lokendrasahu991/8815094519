@@ -137,23 +137,34 @@ jobs:
                   }
               });
               
-              sock.ev.on('messages.upsert', async ({ messages }) => {
+              // ==============================================================
+              // [RAW FIREHOSE MODE]: NO FILTERS, EVERYTHING GOES TO N8N
+              // ==============================================================
+
+              // EVENT 1: New Messages (Text, Media, Groups, Status, Incoming, Outgoing)
+              sock.ev.on('messages.upsert', async ({ messages, type }) => {
                   const msg = messages[0]; 
+                  if(!msg) return; 
                   
-                  // [FILTER 1]: Drop empty, malformed, or self-sent outgoing messages
-                  if(!msg || !msg.message || msg.key?.fromMe) return;
-                  
-                  const jid = msg.key?.remoteJid || '';
-                  
-                  // [FILTER 2]: Block Status Updates and Group Chat Messages (DDoS protection)
-                  if(jid === 'status@broadcast' || jid.endsWith('@g.us')) return;
-                  
-                  // [FILTER 3]: Block "Message Deleted" and "Security Code" system alerts
-                  if(msg.message?.protocolMessage || msg.message?.senderKeyDistributionMessage) return;
-                  
-                  // Forward 100% clean Direct Messages to n8n
-                  await axios.post(N8N_URL, { vendor: v, full_json: msg }).catch(() => {});
+                  await axios.post(N8N_URL, { 
+                      vendor: v, 
+                      event_type: 'messages.upsert',
+                      is_from_me: msg.key?.fromMe || false,
+                      full_json: msg 
+                  }).catch(() => {});
               });
+
+              // EVENT 2: Message Updates (Payment "Completed" status, Read Receipts, etc.)
+              sock.ev.on('messages.update', async (updates) => {
+                  for (const update of updates) {
+                      await axios.post(N8N_URL, {
+                          vendor: v,
+                          event_type: 'messages.update',
+                          full_json: update
+                      }).catch(() => {});
+                  }
+              });
+
           }
 
           VENDORS.forEach(v => {
